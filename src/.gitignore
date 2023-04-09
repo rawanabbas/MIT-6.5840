@@ -2,6 +2,7 @@
 main/mr-tmp/
 mrtmp.*
 824-mrinput-*.txt
+5840-mrinput-*.txt
 /main/diff.out
 /mapreduce/x.txt
 /pbservice/x.txt
