@@ -175,6 +175,7 @@ func (rf *Raft) handleShutdown(event *Event) {
 		close(rf.commitCh)
 	}
 	rf.commitCh = nil
+	close(rf.eventCh)
 }
 
 func (rf *Raft) handleSnapshot(event *Event) {

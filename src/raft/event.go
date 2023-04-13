@@ -21,6 +21,9 @@ type Event struct {
 }
 
 func (rf *Raft) emit(event *Event, async bool) {
+	if rf.killed() {
+		return
+	}
 	if async {
 		go func() {
 			rf.eventCh <- event
