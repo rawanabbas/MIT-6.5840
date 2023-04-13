@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"math/rand"
 	"sync"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	Logger "6.5840/logger"
 	"go.uber.org/zap"
@@ -284,6 +286,15 @@ func (rf *Raft) String() string {
 	return fmt.Sprintf("Server %d: Term %d State %s", rf.me, rf.currentTerm.Load(), state)
 }
 
+func (rf *Raft) generateRaftState() []byte {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(rf.currentTerm.Load()) != nil || e.Encode(rf.getVotedFor()) != nil || e.Encode(rf.log) != nil || e.Encode(rf.getLastSnapshottedIndex()) != nil || e.Encode(rf.getLastSnapshottedTerm()) != nil {
+		return nil
+	}
+	return w.Bytes()
+}
+
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
@@ -292,14 +303,13 @@ func (rf *Raft) String() string {
 // after you've implemented snapshots, pass the current snapshot
 // (or nil if there's not yet a snapshot).
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	raftState := rf.generateRaftState()
+	if raftState == nil {
+		// TODO: handle error
+		rf.logger.Errorf("%v Failed to generate raft state", rf.String())
+	} else {
+		rf.persister.Save(raftState, nil)
+	}
 }
 
 // restore previously persisted state.
@@ -307,19 +317,20 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&lastSnapshotIndex) != nil || d.Decode(&lastSnapshotTerm) != nil {
+		rf.logger.Errorf("%v Failed to decode raft state", rf.String())
+		return
+	}
+	rf.setCurrentTerm(currentTerm)
+	rf.setLastSnasphottedIndex(lastSnapshotIndex)
+	rf.setLastSnasphottedTerm(lastSnapshotTerm)
+	rf.setVotedFor(votedFor)
+	rf.log = log
+
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -460,7 +471,6 @@ func (rf *Raft) canCommit(term int) {
 		}
 	}
 	if commitIndex != rf.getCommitIndex() {
-		rf.logger.Debugf("%v Need to commit %d", rf.String(), rf.getCommitIndex())
 		select {
 		case rf.commitCh <- true:
 		default:

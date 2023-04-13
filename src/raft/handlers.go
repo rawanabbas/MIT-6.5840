@@ -5,7 +5,6 @@ func (rf *Raft) defaultHandler(event *Event) {
 }
 
 func (rf *Raft) handleRequestVote(event *Event) {
-	rf.logger.Debugf("%v Got a RequestVote event", rf.String())
 	request := event.Payload.(*RequestVoteArgs)
 	reply := &RequestVoteReply{}
 
@@ -60,12 +59,9 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 	rf.resetElectionTimer()
 	lastLogIndex := rf.getLastLogIndex()
 	if request.PrevLogIndex > lastLogIndex {
-		rf.logger.Debugf("%v PrevLogIndex %v > lastLogIndex %v", rf.String(), request.PrevLogIndex, lastLogIndex)
-		rf.logger.Debugf("%v Logs: %v", rf.String(), rf.log)
 		reply.XLen = lastLogIndex + 1
 		return
 	}
-	rf.logger.Debugf("%v Request: %v", rf.String(), request)
 	var prevLogTerm int
 	switch {
 	case request.PrevLogIndex == rf.getLastSnapshottedIndex():
@@ -119,9 +115,7 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 			rf.persist()
 		}
 	}
-	rf.logger.Debugf("%v Checking LC > MC %v > %v", rf.String(), request.LeaderCommit, rf.getCommitIndex())
 	if request.LeaderCommit > rf.getCommitIndex() {
-		rf.logger.Debugf("%v Setting MC to %v", rf.String(), min(request.LeaderCommit, rf.getLastLogIndex()))
 		rf.setCommitIndex(min(request.LeaderCommit, rf.getLastLogIndex()))
 		select {
 		case rf.commitCh <- true:

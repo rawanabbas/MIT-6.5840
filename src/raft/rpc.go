@@ -40,7 +40,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		r := resp.(*RequestVoteReply)
 		reply.Term = r.Term
 		reply.VoteGranted = r.VoteGranted
-		rf.persist()
 		return
 	}
 }
@@ -67,7 +66,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = r.XLen
 		reply.XTerm = r.XTerm
 		reply.XIndex = r.XIndex
-		rf.persist()
 		return
 	}
 }
