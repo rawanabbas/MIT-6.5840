@@ -35,11 +35,9 @@ func (rf *Raft) handleRequestVote(event *Event) {
 }
 
 func (rf *Raft) handleAppendEntries(event *Event) {
-	rf.logger.Debugf("%v Got an AppendEntries event", rf.String())
-
 	request := event.Payload.(*AppendEntriesArgs)
 	reply := &AppendEntriesReply{}
-
+	rf.logger.Debugf("%v Got an AppendEntries event %v with LC %v MC %v", rf.String(), len(request.Entries), request.LeaderCommit, rf.getCommitIndex())
 	rf.lock()
 	defer rf.unlock()
 	defer func() { event.Response <- reply }()
@@ -62,10 +60,12 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 	rf.resetElectionTimer()
 	lastLogIndex := rf.getLastLogIndex()
 	if request.PrevLogIndex > lastLogIndex {
+		rf.logger.Debugf("%v PrevLogIndex %v > lastLogIndex %v", rf.String(), request.PrevLogIndex, lastLogIndex)
+		rf.logger.Debugf("%v Logs: %v", rf.String(), rf.log)
 		reply.XLen = lastLogIndex + 1
 		return
 	}
-
+	rf.logger.Debugf("%v Request: %v", rf.String(), request)
 	var prevLogTerm int
 	switch {
 	case request.PrevLogIndex == rf.getLastSnapshottedIndex():
@@ -85,12 +85,11 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 			request.Entries = make([]LogEntry, 0)
 		}
 	default:
-		prevLogTerm = rf.getLogEntry(request.PrevLogIndex - 1).Term
+		prevLogTerm = rf.getLogEntry(request.PrevLogIndex).Term
 	}
-
 	if prevLogTerm != request.PrevLogTerm {
 		reply.XTerm = prevLogTerm
-		for i := request.PrevLogIndex - 1; i >= rf.getLastSnapshottedIndex(); i-- {
+		for i := request.PrevLogIndex; i >= rf.getLastSnapshottedIndex(); i-- {
 			reply.XIndex = rf.getLogEntry(i).Index
 			if rf.getLogEntry(i).Term != prevLogTerm {
 				break
@@ -101,23 +100,32 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 
 	reply.Success = true
 	if len(request.Entries) > 0 {
-		entries := rf.log[request.PrevLogIndex-rf.getLastSnapshottedIndex():]
+		entries := rf.log[request.PrevLogIndex-rf.getLastSnapshottedIndex()+1:]
 		var i int
 		presist := false
 		for i = 0; i < min(len(entries), len(request.Entries)); i++ {
 			if entries[i].Term != request.Entries[i].Term {
-				rf.log = rf.log[:request.PrevLogIndex-rf.getLastSnapshottedIndex()+i]
+				rf.log = rf.log[:request.PrevLogIndex-rf.getLastSnapshottedIndex()+i+1]
 				presist = true
 				break
 			}
 		}
 		if i < len(request.Entries) {
-			rf.log = append(rf.log, request.Entries[i:]...)
+			rf.addLogEntry(request.Entries[i:]...)
 			presist = true
 		}
 
 		if presist {
 			rf.persist()
+		}
+	}
+	rf.logger.Debugf("%v Checking LC > MC %v > %v", rf.String(), request.LeaderCommit, rf.getCommitIndex())
+	if request.LeaderCommit > rf.getCommitIndex() {
+		rf.logger.Debugf("%v Setting MC to %v", rf.String(), min(request.LeaderCommit, rf.getLastLogIndex()))
+		rf.setCommitIndex(min(request.LeaderCommit, rf.getLastLogIndex()))
+		select {
+		case rf.commitCh <- true:
+		default:
 		}
 	}
 
@@ -149,8 +157,8 @@ func (rf *Raft) handleEndElections(event *Event) {
 	} else {
 		rf.lock()
 		term := rf.getCurrentTerm()
-		rf.unlock()
 		rf.stepDown(term)
+		rf.unlock()
 	}
 }
 

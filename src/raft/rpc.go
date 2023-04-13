@@ -63,6 +63,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		r := resp.(*AppendEntriesReply)
 		reply.Term = r.Term
 		reply.Success = r.Success
+		reply.LeaderId = r.LeaderId
+		reply.XLen = r.XLen
+		reply.XTerm = r.XTerm
+		reply.XIndex = r.XIndex
 		rf.persist()
 		return
 	}

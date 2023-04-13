@@ -39,7 +39,6 @@ const (
 	LEADER_ID_NONE       = -1
 	INIT_TERM            = 0
 	INIT_INDEX           = 0
-	COMMAND_NOOP         = -1
 )
 
 // as each Raft peer becomes aware that successive log entries are
@@ -236,7 +235,8 @@ func (rf *Raft) setLastSnasphottedTerm(term int) {
 
 func (rf *Raft) getLogEntry(index int) LogEntry {
 	firstIdx := rf.getLastSnapshottedIndex()
-	return rf.log[index-firstIdx]
+	log := rf.log[index-firstIdx]
+	return log
 }
 
 func (rf *Raft) addLogEntry(entries ...LogEntry) {
@@ -396,10 +396,41 @@ func (rf *Raft) sendAppendEntries(server int, term int, args *AppendEntriesArgs,
 
 		nextIndex := max(args.PrevLogIndex+len(args.Entries)+1, oldNextIndex)
 		matchIndex := max(args.PrevLogIndex+len(args.Entries), oldMatchIndex)
-
 		rf.setNextIndex(server, nextIndex)
 		rf.setMatchIndex(server, matchIndex)
+
+		go rf.canCommit(term)
+		return
 	}
+
+	if reply.XLen != 0 && reply.XTerm == 0 {
+		rf.setNextIndex(server, reply.XLen)
+	} else {
+		var xindex, xterm int
+		for i := len(rf.log) - 1; i >= -1; i-- {
+			if i < 0 {
+				xindex, xterm = rf.getLastLogIndexTerm()
+			} else {
+				xindex, xterm = rf.log[i].Index, rf.log[i].Term
+			}
+
+			if xterm == reply.XTerm {
+				rf.setNextIndex(server, xindex+1)
+				break
+			}
+
+			if xterm < reply.XTerm {
+				rf.setNextIndex(server, reply.XIndex)
+				break
+			}
+
+			if i < 0 {
+				// TODO: Install Snapshot
+				rf.setNextIndex(server, rf.getLastSnapshottedIndex()+1)
+			}
+		}
+	}
+
 }
 
 func (rf *Raft) canCommit(term int) {
@@ -419,9 +450,6 @@ func (rf *Raft) canCommit(term int) {
 		if rf.getLogEntry(n).Term == term {
 			count := 1
 			for i := range rf.peers {
-				if i == rf.me {
-					continue
-				}
 				if rf.getMatchIndex(i) >= n {
 					count++
 				}
@@ -432,6 +460,7 @@ func (rf *Raft) canCommit(term int) {
 		}
 	}
 	if commitIndex != rf.getCommitIndex() {
+		rf.logger.Debugf("%v Need to commit %d", rf.String(), rf.getCommitIndex())
 		select {
 		case rf.commitCh <- true:
 		default:
@@ -454,10 +483,36 @@ func (rf *Raft) canCommit(term int) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
+	isLeader := false
 
-	// Your code here (2B).
+	rf.lock()
+	defer rf.unlock()
 
+	if rf.getRole() != Leader || rf.killed() {
+		return index, term, isLeader
+	}
+
+	isLeader = true
+	term = rf.getCurrentTerm()
+	index = rf.getNextIndex(rf.me)
+
+	rf.log = append(rf.log, LogEntry{
+		Term:    term,
+		Command: command,
+		Index:   index,
+	})
+
+	rf.setNextIndex(rf.me, index+1)
+	rf.setMatchIndex(rf.me, index)
+	rf.persist()
+	for i, ch := range rf.appendEntriesCh {
+		if i != rf.me {
+			select {
+			case ch <- 0:
+			default:
+			}
+		}
+	}
 	return index, term, isLeader
 }
 
@@ -612,6 +667,7 @@ func (rf *Raft) resetVolatileState() {
 		rf.setNextIndex(peer, lastLogIndex+1)
 		rf.setMatchIndex(peer, 0)
 	}
+	rf.setMatchIndex(rf.me, lastLogIndex)
 }
 
 func (rf *Raft) isMyLogLeading(index int, term int) bool {
@@ -642,21 +698,21 @@ func (rf *Raft) heartbeat(term int) {
 func (rf *Raft) constructAppendEntriesRequest(server int) *AppendEntriesArgs {
 	prevLogIndex := rf.getNextIndex(server) - 1
 	prevLogTerm := rf.getLastSnapshottedTerm()
-	if i := prevLogIndex - rf.getLastSnapshottedIndex(); i >= 0 {
-		prevLogTerm = rf.log[i].Term
+	if i := prevLogIndex; i >= rf.getLastSnapshottedIndex() {
+		prevLogTerm = rf.getLogEntry(i).Term
 	}
+
 	var entries []LogEntry
 
 	if lastLogIndex := rf.getLastLogIndex(); lastLogIndex <= prevLogIndex {
 		entries = nil
 	} else if prevLogIndex >= rf.getLastSnapshottedIndex() {
-		newEntries := rf.log[prevLogIndex-rf.getLastSnapshottedIndex():]
+		newEntries := rf.log[prevLogIndex-rf.getLastSnapshottedIndex()+1:]
 		entries = make([]LogEntry, len(newEntries))
 		copy(entries, newEntries)
 	} else {
 		entries = nil
 	}
-
 	args := AppendEntriesArgs{
 		Term:         rf.getCurrentTerm(),
 		LeaderId:     rf.me,
@@ -696,9 +752,10 @@ func (rf *Raft) appender(server int, ch <-chan int, term int) {
 }
 
 func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
+	rf.logger.Debugf("Committer for %v", rf.String())
 	defer func() {
 		close(applyCh)
-		for _ = range commitCh {
+		for range commitCh {
 			<-commitCh
 		}
 	}()
@@ -728,10 +785,9 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 			applyCh <- applyMsg
 			continue
 		}
-
-		for rf.commitCh != nil && rf.getCommitIndex() > rf.getLastApplied() {
-			entry := rf.getLogEntry(rf.getLastApplied())
+		for rf.getCommitIndex() > rf.getLastApplied() {
 			rf.incLastApplied()
+			entry := rf.getLogEntry(rf.getLastApplied())
 			rf.unlock()
 			applyMsg := ApplyMsg{
 				CommandValid: true,
@@ -739,6 +795,7 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 				CommandIndex: entry.Index,
 			}
 			applyCh <- applyMsg
+
 			rf.lock()
 		}
 
@@ -774,7 +831,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.setLeaderId(LEADER_ID_NONE)
 	rf.setLastSnasphottedIndex(INIT_INDEX)
 	rf.setLastSnasphottedTerm(INIT_TERM)
-	rf.addLogEntry(LogEntry{Term: INIT_TERM, Index: INIT_INDEX, Command: COMMAND_NOOP})
+	rf.addLogEntry(LogEntry{Term: INIT_TERM, Index: INIT_INDEX, Command: nil})
 	rf.resetElectionTimer()
 
 	rf.applyCh = applyCh

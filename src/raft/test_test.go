@@ -278,29 +278,39 @@ func TestFailAgree2B(t *testing.T) {
 	defer cfg.cleanup()
 
 	cfg.begin("Test (2B): agreement after follower reconnects")
-
+	cfg.t.Logf("Agreeing on 101")
 	cfg.one(101, servers, false)
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
+	cfg.t.Logf("Disconnecting %v", (leader+1)%servers)
 	cfg.disconnect((leader + 1) % servers)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
+	cfg.t.Logf("%v Agreeing on 102", servers-1)
 	cfg.one(102, servers-1, false)
+	cfg.t.Logf("%v Agreeing on 103", servers-1)
 	cfg.one(103, servers-1, false)
+	cfg.t.Logf("Sleeping %v", RaftElectionTimeout)
 	time.Sleep(RaftElectionTimeout)
+	cfg.t.Logf("%v Agreeing on 104", servers-1)
 	cfg.one(104, servers-1, false)
+	cfg.t.Logf("%v Agreeing on 105", servers-1)
 	cfg.one(105, servers-1, false)
 
 	// re-connect
+	cfg.t.Logf("Reconnecting %v", (leader+1)%servers)
 	cfg.connect((leader + 1) % servers)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
 	// on new commands.
+	cfg.t.Logf("%v Agreeing on 106", servers)
 	cfg.one(106, servers, true)
+	cfg.t.Logf("Sleeping %v", RaftElectionTimeout)
 	time.Sleep(RaftElectionTimeout)
+	cfg.t.Logf("%v Agreeing on 107", servers)
 	cfg.one(107, servers, true)
 
 	cfg.end()
