@@ -536,9 +536,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	atomic.StoreInt32(&rf.dead, 1)
-	// Your code here, if desired.
-	// close(rf.eventCh)
+	evt := rf.createEvent(EVENT_SHUTDOWN, nil, nil)
+	rf.emit(evt, false)
 }
 
 func (rf *Raft) killed() bool {
@@ -567,8 +566,8 @@ func (rf *Raft) ticker() {
 
 func (rf *Raft) serve() {
 	for !rf.killed() {
-		event := <-rf.eventCh
-		if rf.killed() {
+		event, ok := <-rf.eventCh
+		if rf.killed() || !ok {
 			return
 		}
 		rf.lock()

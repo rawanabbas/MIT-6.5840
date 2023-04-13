@@ -1,5 +1,7 @@
 package raft
 
+import "sync/atomic"
+
 func (rf *Raft) defaultHandler(event *Event) {
 	rf.logger.Warnf("%v Got an event %v while on state %v", rf.String(), event.Name, rf.getRoleString())
 }
@@ -158,6 +160,21 @@ func (rf *Raft) handleEndElections(event *Event) {
 
 func (rf *Raft) handleShutdown(event *Event) {
 	rf.logger.Debugf("%v Got a Shutdown event", rf.String())
+	atomic.StoreInt32(&rf.dead, 1)
+	rf.lock()
+	defer rf.unlock()
+	for _, ch := range rf.appendEntriesCh {
+		if ch != nil {
+			close(ch)
+		}
+	}
+
+	rf.appendEntriesCh = nil
+
+	if rf.commitCh != nil {
+		close(rf.commitCh)
+	}
+	rf.commitCh = nil
 }
 
 func (rf *Raft) handleSnapshot(event *Event) {
