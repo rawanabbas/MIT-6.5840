@@ -39,6 +39,7 @@ const (
 	HEARTBEAT_TIMEOUT    = 50
 	VOTED_FOR_NONE       = -1
 	LEADER_ID_NONE       = -1
+	LEADER_LOG_TRAIL     = 20
 	INIT_TERM            = 0
 	INIT_INDEX           = 0
 )
@@ -82,6 +83,11 @@ func (l LogEntry) String() string {
 	return fmt.Sprintf("Index: %d Term: %d Command: %v", l.Index, l.Term, l.Command)
 }
 
+type SnapshotCommand struct {
+	Index int
+	Bytes []byte
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
@@ -110,10 +116,13 @@ type Raft struct {
 	matchIndex []int
 
 	// Channels
-	eventCh         chan *Event
-	applyCh         chan ApplyMsg
-	appendEntriesCh []chan int
-	commitCh        chan bool
+	eventCh           chan *Event
+	applyCh           chan ApplyMsg
+	appendEntriesCh   []chan int
+	installSnapshotCh []chan int
+	commitCh          chan bool
+	snapshotCh        chan SnapshotCommand
+	snapshotTrigger   chan bool
 
 	//Utility
 	logger                   *zap.SugaredLogger
@@ -241,12 +250,13 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 	return log
 }
 
-func (rf *Raft) addLogEntry(entries ...LogEntry) {
-	rf.log = append(rf.log, entries...)
+func (rf *Raft) trimLogs(index int) {
+	firstIdx := rf.getLastSnapshottedIndex()
+	rf.log = rf.log[index-firstIdx:]
 }
 
-func (rf *Raft) getLeaderId() int {
-	return int(rf.leader.Load())
+func (rf *Raft) addLogEntry(entries ...LogEntry) {
+	rf.log = append(rf.log, entries...)
 }
 
 func (rf *Raft) setLeaderId(leader int) {
@@ -411,9 +421,17 @@ func (rf *Raft) sendAppendEntries(server int, term int, args *AppendEntriesArgs,
 		rf.setMatchIndex(server, matchIndex)
 
 		go rf.canCommit(term)
+
+		if rf.getNextIndex(server) > oldNextIndex {
+			select {
+			case rf.snapshotTrigger <- true:
+			default:
+			}
+		}
+
 		return
 	}
-
+	installSnapshot := false
 	if reply.XLen != 0 && reply.XTerm == 0 {
 		rf.setNextIndex(server, reply.XLen)
 	} else {
@@ -436,9 +454,16 @@ func (rf *Raft) sendAppendEntries(server int, term int, args *AppendEntriesArgs,
 			}
 
 			if i < 0 {
-				// TODO: Install Snapshot
+				installSnapshot = true
 				rf.setNextIndex(server, rf.getLastSnapshottedIndex()+1)
 			}
+		}
+	}
+
+	if installSnapshot || rf.getNextIndex(server) <= rf.getLastSnapshottedIndex() {
+		select {
+		case rf.installSnapshotCh[server] <- 0:
+		default:
 		}
 	}
 
@@ -457,7 +482,7 @@ func (rf *Raft) canCommit(term int) {
 	}
 
 	commitIndex := rf.getCommitIndex()
-	for n := commitIndex + 1; n <= rf.getLastLogIndex()+rf.getLastSnapshottedIndex(); n++ {
+	for n := commitIndex + 1; n <= rf.getLastLogIndex(); n++ {
 		if rf.getLogEntry(n).Term == term {
 			count := 1
 			for i := range rf.peers {
@@ -505,7 +530,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = true
 	term = rf.getCurrentTerm()
 	index = rf.getNextIndex(rf.me)
-
 	rf.log = append(rf.log, LogEntry{
 		Term:    term,
 		Command: command,
@@ -656,6 +680,14 @@ func (rf *Raft) winElections() {
 		rf.appendEntriesCh[i] = make(chan int)
 		go rf.appender(i, rf.appendEntriesCh[i], term)
 	}
+	rf.installSnapshotCh = make([]chan int, len(rf.peers))
+	for i := range rf.installSnapshotCh {
+		if i == rf.me {
+			continue
+		}
+		rf.installSnapshotCh[i] = make(chan int)
+		// TODO: implement snapshot installer
+	}
 	rf.unlock()
 	go rf.heartbeat(term)
 }
@@ -666,6 +698,10 @@ func (rf *Raft) stepDown(term int) {
 	rf.setVotedFor(VOTED_FOR_NONE)
 	rf.setCurrentTerm(term)
 	rf.persist()
+	select {
+	case rf.snapshotTrigger <- true:
+	default:
+	}
 }
 
 func (rf *Raft) resetVolatileState() {
@@ -707,8 +743,8 @@ func (rf *Raft) heartbeat(term int) {
 func (rf *Raft) constructAppendEntriesRequest(server int) *AppendEntriesArgs {
 	prevLogIndex := rf.getNextIndex(server) - 1
 	prevLogTerm := rf.getLastSnapshottedTerm()
-	if i := prevLogIndex; i >= rf.getLastSnapshottedIndex() {
-		prevLogTerm = rf.getLogEntry(i).Term
+	if prevLogIndex > rf.getLastSnapshottedIndex() {
+		prevLogTerm = rf.getLogEntry(prevLogIndex).Term
 	}
 
 	var entries []LogEntry
@@ -777,7 +813,6 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 		if !commit {
 			rf.commitCh = commitCh
 			data := rf.persister.ReadSnapshot()
-			// TODO: Send Snapshot and Commit it!
 			if rf.getLastSnapshottedIndex() == 0 || len(data) == 0 {
 				rf.unlock()
 				continue
@@ -813,6 +848,62 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 	}
 }
 
+func (rf *Raft) snapshotter(trigger <-chan bool) {
+	rf.logger.Debugf("%v Snapshotter", rf.String())
+	var index int
+	var snapshot []byte
+	cmdCh := rf.snapshotCh
+	for !rf.killed() {
+		select {
+		case cmd := <-cmdCh:
+			index, snapshot = cmd.Index, cmd.Bytes
+		case _, ok := <-trigger:
+			if !ok {
+				return
+			}
+		}
+		rf.lock()
+		suspendSnapshot := rf.shouldSuspendSnapshot(index)
+		if cmdCh == nil {
+			if suspendSnapshot {
+				rf.unlock()
+				continue
+			}
+			cmdCh = rf.snapshotCh
+		}
+
+		switch {
+		case index <= rf.getLastSnapshottedIndex():
+			// Already Snapshotted
+		case suspendSnapshot:
+			cmdCh = nil
+		default:
+			term := rf.getLogEntry(index).Term
+			rf.trimLogs(index)
+			rf.setLastSnasphottedTerm(term)
+			rf.setLastSnasphottedIndex(index)
+			state := rf.generateRaftState()
+			rf.persister.Save(state, snapshot)
+		}
+
+		rf.unlock()
+	}
+}
+
+func (rf *Raft) shouldSuspendSnapshot(index int) bool {
+	if rf.getRole() != Leader {
+		return false
+	}
+
+	for peer := range rf.peers {
+		if dist := index - rf.getNextIndex(peer); dist >= 0 && dist <= LEADER_LOG_TRAIL {
+			return true
+		}
+	}
+
+	return false
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -834,8 +925,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.setVotedFor(VOTED_FOR_NONE)
 	rf.setCurrentTerm(INIT_TERM)
-	rf.setCommitIndex(INIT_INDEX)
-	rf.setLastApplied(INIT_INDEX)
 	rf.setRole(Follower)
 	rf.setLeaderId(LEADER_ID_NONE)
 	rf.setLastSnasphottedIndex(INIT_INDEX)
@@ -845,8 +934,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.applyCh = applyCh
 	rf.eventCh = make(chan *Event)
-	rf.commitCh = make(chan bool, 1)
+	rf.commitCh = make(chan bool)
 	rf.appendEntriesCh = nil
+	rf.snapshotTrigger = make(chan bool, 1)
+	rf.snapshotCh = make(chan SnapshotCommand)
 
 	rf.eventHandlers = make(map[Role]map[string]func(event *Event))
 	rf.eventHandlers[Follower] = make(map[string]func(event *Event))
@@ -865,10 +956,14 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.setCommitIndex(rf.getLastSnapshottedIndex())
+	rf.setLastApplied(rf.getLastSnapshottedIndex())
+
 	// start ticker goroutine to start elections
 	go rf.ticker()
 	go rf.serve()
 	go rf.committer(applyCh, rf.commitCh)
+	go rf.snapshotter(rf.snapshotTrigger)
 
 	return rf
 }

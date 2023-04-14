@@ -180,6 +180,8 @@ func (rf *Raft) handleShutdown(event *Event) {
 
 func (rf *Raft) handleSnapshot(event *Event) {
 	rf.logger.Debugf("%v Got a Snapshot event", rf.String())
+	cmd := event.Payload.(*SnapshotCommand)
+	rf.snapshotCh <- *cmd
 }
 
 func (rf *Raft) handleInstallSnapshot(event *Event) {

@@ -49,8 +49,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
+	rf.logger.Debugf("%v Snapshot called with index %v", rf.String(), index)
+	cmd := &SnapshotCommand{
+		Index: index,
+		Bytes: snapshot,
+	}
+	event := rf.createEvent(EVENT_SNAPSHOT, cmd, nil)
+	rf.emit(event, false)
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
