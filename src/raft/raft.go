@@ -100,8 +100,9 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	role   Role
-	leader atomic.Int32
+	role    Role
+	roleStr string
+	leader  atomic.Int32
 	// Persistent state on all servers
 	currentTerm atomic.Int32
 	votedFor    atomic.Int32
@@ -209,6 +210,14 @@ func (rf *Raft) getMatchIndex(index int) int {
 
 func (rf *Raft) setRole(role Role) {
 	rf.role = role
+	switch rf.role {
+	case Leader:
+		rf.roleStr = "Leader"
+	case Follower:
+		rf.roleStr = "Follower"
+	case Candidate:
+		rf.roleStr = "Candidate"
+	}
 }
 
 func (rf *Raft) getRole() Role {
@@ -232,7 +241,7 @@ func (rf *Raft) getLastSnapshottedIndex() int {
 	return int(rf.lastSnapshotIndex.Load())
 }
 
-func (rf *Raft) setLastSnasphottedIndex(index int) {
+func (rf *Raft) setLastSnapshottedIndex(index int) {
 	rf.lastSnapshotIndex.Store(int32(index))
 }
 
@@ -240,19 +249,21 @@ func (rf *Raft) getLastSnapshottedTerm() int {
 	return int(rf.lastSnapshotTerm.Load())
 }
 
-func (rf *Raft) setLastSnasphottedTerm(term int) {
+func (rf *Raft) setLastSnapshottedTerm(term int) {
 	rf.lastSnapshotTerm.Store(int32(term))
 }
 
 func (rf *Raft) getLogEntry(index int) LogEntry {
-	firstIdx := rf.getLastSnapshottedIndex()
-	log := rf.log[index-firstIdx]
-	return log
+	firstIdx := rf.log[0].Index
+	realIdx := index - firstIdx
+	return rf.log[realIdx]
 }
 
 func (rf *Raft) trimLogs(index int) {
-	firstIdx := rf.getLastSnapshottedIndex()
-	rf.log = rf.log[index-firstIdx:]
+	firstIdx := rf.log[0].Index
+	rf.Debugf("firstIdx: %d realIdx: %d [%v]", firstIdx, index-firstIdx, rf.log[index-firstIdx])
+	rf.Debugf("from %v to %v", rf.log, rf.log[index-firstIdx+1:])
+	rf.log = rf.log[index-firstIdx+1:]
 }
 
 func (rf *Raft) addLogEntry(entries ...LogEntry) {
@@ -268,7 +279,7 @@ func (rf *Raft) getLastLogIndex() int {
 	if len(rf.log) > 0 {
 		return rf.log[len(rf.log)-1].Index
 	}
-	return -1
+	return rf.getLastSnapshottedIndex()
 }
 
 func (rf *Raft) getLastLogIndexTerm() (int, int) {
@@ -276,7 +287,7 @@ func (rf *Raft) getLastLogIndexTerm() (int, int) {
 		lastLog := rf.log[len(rf.log)-1]
 		return lastLog.Index, lastLog.Term
 	}
-	return -1, -1
+	return rf.getLastSnapshottedIndex(), rf.getLastSnapshottedTerm()
 }
 
 func (rf *Raft) incCurrentTerm() {
@@ -284,16 +295,7 @@ func (rf *Raft) incCurrentTerm() {
 }
 
 func (rf *Raft) String() string {
-	state := ""
-	switch rf.role {
-	case Leader:
-		state = "Leader"
-	case Follower:
-		state = "Follower"
-	case Candidate:
-		state = "Candidate"
-	}
-	return fmt.Sprintf("Server %d: Term %d State %s", rf.me, rf.currentTerm.Load(), state)
+	return fmt.Sprintf("Server %d: Term %d State %s", rf.me, rf.currentTerm.Load(), rf.roleStr)
 }
 
 func (rf *Raft) generateRaftState() []byte {
@@ -315,10 +317,9 @@ func (rf *Raft) generateRaftState() []byte {
 func (rf *Raft) persist() {
 	raftState := rf.generateRaftState()
 	if raftState == nil {
-		// TODO: handle error
-		rf.logger.Errorf("%v Failed to generate raft state", rf.String())
+		rf.Errorf("Failed to generate raft state")
 	} else {
-		rf.persister.Save(raftState, nil)
+		rf.persister.Save(raftState, rf.persister.ReadSnapshot())
 	}
 }
 
@@ -332,12 +333,12 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm int
 	var log []LogEntry
 	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&lastSnapshotIndex) != nil || d.Decode(&lastSnapshotTerm) != nil {
-		rf.logger.Errorf("%v Failed to decode raft state", rf.String())
+		rf.Errorf("Failed to decode raft state")
 		return
 	}
 	rf.setCurrentTerm(currentTerm)
-	rf.setLastSnasphottedIndex(lastSnapshotIndex)
-	rf.setLastSnasphottedTerm(lastSnapshotTerm)
+	rf.setLastSnapshottedIndex(lastSnapshotIndex)
+	rf.setLastSnapshottedTerm(lastSnapshotTerm)
 	rf.setVotedFor(votedFor)
 	rf.log = log
 
@@ -467,6 +468,46 @@ func (rf *Raft) sendAppendEntries(server int, term int, args *AppendEntriesArgs,
 		}
 	}
 
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply, serial int) {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+
+	rf.lock()
+	defer rf.unlock()
+
+	if rf.getRole() != Leader || rf.killed() {
+		return
+	}
+
+	if !ok {
+		select {
+		case rf.installSnapshotCh[server] <- serial:
+		default:
+		}
+		return
+	}
+
+	if reply.Term > rf.getCurrentTerm() {
+		rf.stepDown(reply.Term)
+		rf.resetElectionTimer()
+		return
+	}
+
+	if args.Term != rf.getCurrentTerm() {
+		return
+	}
+
+	nextIndex := rf.getNextIndex(server)
+	rf.setNextIndex(server, max(rf.getNextIndex(server), args.LastSnapshottedIndex+1))
+	rf.setMatchIndex(server, max(rf.getMatchIndex(server), args.LastSnapshottedIndex))
+
+	if rf.getNextIndex(server) > nextIndex {
+		select {
+		case rf.snapshotTrigger <- true:
+		default:
+		}
+	}
 }
 
 func (rf *Raft) canCommit(term int) {
@@ -667,7 +708,7 @@ func (rf *Raft) broadcastRequestVote() {
 }
 
 func (rf *Raft) winElections() {
-	rf.logger.Infof("%v won the election", rf.String())
+	rf.Infof("won the election")
 	rf.lock()
 	rf.setRole(Leader)
 	rf.resetVolatileState()
@@ -686,14 +727,14 @@ func (rf *Raft) winElections() {
 			continue
 		}
 		rf.installSnapshotCh[i] = make(chan int)
-		// TODO: implement snapshot installer
+		go rf.snapshotInstaller(i, rf.installSnapshotCh[i], term)
 	}
 	rf.unlock()
 	go rf.heartbeat(term)
 }
 
 func (rf *Raft) stepDown(term int) {
-	rf.logger.Debugf("%v Step down", rf.String())
+	rf.Debugf("Step down")
 	rf.setRole(Follower)
 	rf.setVotedFor(VOTED_FOR_NONE)
 	rf.setCurrentTerm(term)
@@ -752,7 +793,8 @@ func (rf *Raft) constructAppendEntriesRequest(server int) *AppendEntriesArgs {
 	if lastLogIndex := rf.getLastLogIndex(); lastLogIndex <= prevLogIndex {
 		entries = nil
 	} else if prevLogIndex >= rf.getLastSnapshottedIndex() {
-		newEntries := rf.log[prevLogIndex-rf.getLastSnapshottedIndex()+1:]
+		rf.Debugf("construct append, prev idx: %v, sending logs %v", prevLogIndex, rf.log[prevLogIndex-rf.log[0].Index+1:])
+		newEntries := rf.log[prevLogIndex-rf.log[0].Index+1:]
 		entries = make([]LogEntry, len(newEntries))
 		copy(entries, newEntries)
 	} else {
@@ -769,6 +811,18 @@ func (rf *Raft) constructAppendEntriesRequest(server int) *AppendEntriesArgs {
 	return &args
 }
 
+func (rf *Raft) constructInstallSnapshotRequest(server int) *InstallSnapshotArgs {
+	args := InstallSnapshotArgs{
+		Term:                 rf.getCurrentTerm(),
+		LeaderId:             rf.me,
+		LastSnapshottedIndex: rf.getLastSnapshottedIndex(),
+		LastSnapshottedTerm:  rf.getLastSnapshottedTerm(),
+		Data:                 rf.persister.ReadSnapshot(),
+	}
+	rf.Debugf("Construct install sn: %v|T%v [%v]", rf.getLastSnapshottedIndex(), rf.getLastSnapshottedTerm(), len(rf.persister.ReadSnapshot()))
+	return &args
+}
+
 func (rf *Raft) appender(server int, ch <-chan int, term int) {
 	curr := 1
 	for !rf.killed() {
@@ -778,14 +832,14 @@ func (rf *Raft) appender(server int, ch <-chan int, term int) {
 		}
 		rf.lock()
 		if rf.getRole() != Leader || rf.getCurrentTerm() != term || rf.killed() {
-			rf.logger.Debugf("Appender for %v exiting", server)
+			rf.Debugf("Appender for %v exiting", server)
 			rf.unlock()
 			return
 		}
 		args := rf.constructAppendEntriesRequest(server)
 		rf.unlock()
 		if args == nil {
-			rf.logger.Infof("Cannot Send Append Entries to %v Should Send Install Snapshot", server)
+			rf.Infof("Cannot Send Append Entries to %v Should Send Install Snapshot", server)
 			continue
 		}
 		reply := AppendEntriesReply{}
@@ -797,7 +851,6 @@ func (rf *Raft) appender(server int, ch <-chan int, term int) {
 }
 
 func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
-	rf.logger.Debugf("Committer for %v", rf.String())
 	defer func() {
 		close(applyCh)
 		for range commitCh {
@@ -811,12 +864,17 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 		}
 		rf.lock()
 		if !commit {
+			rf.Debugf("Applying snapshot")
 			rf.commitCh = commitCh
 			data := rf.persister.ReadSnapshot()
+			rf.Debugf("finished reading snapshot %v || %v", rf.getLastSnapshottedIndex(), len(data))
+
 			if rf.getLastSnapshottedIndex() == 0 || len(data) == 0 {
 				rf.unlock()
+				rf.Debugf("continue")
 				continue
 			}
+			rf.Debugf("last snapshotted index %v/T%v", rf.getLastSnapshottedIndex(), rf.getLastSnapshottedTerm())
 
 			applyMsg := ApplyMsg{
 				CommandValid:  false,
@@ -829,17 +887,21 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 			applyCh <- applyMsg
 			continue
 		}
-		for rf.getCommitIndex() > rf.getLastApplied() {
+		for rf.commitCh != nil && rf.getCommitIndex() > rf.getLastApplied() {
+			rf.Debugf("Applying %v", rf.getLastApplied()+1)
 			rf.incLastApplied()
+			rf.Debugf("IncLastApplied %v", rf.getLastApplied())
 			entry := rf.getLogEntry(rf.getLastApplied())
+			rf.Debugf("logs: %v", rf.log)
 			rf.unlock()
+			rf.Debugf("3 applying: %v  ||  %v", entry.Index, rf.getLastApplied())
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
 			}
 			applyCh <- applyMsg
-
+			rf.Debugf("4 applied %v", entry.Index)
 			rf.lock()
 		}
 
@@ -849,7 +911,6 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 }
 
 func (rf *Raft) snapshotter(trigger <-chan bool) {
-	rf.logger.Debugf("%v Snapshotter", rf.String())
 	var index int
 	var snapshot []byte
 	cmdCh := rf.snapshotCh
@@ -879,13 +940,46 @@ func (rf *Raft) snapshotter(trigger <-chan bool) {
 			cmdCh = nil
 		default:
 			term := rf.getLogEntry(index).Term
+			rf.Debugf("TRIMMING LOGS FROM %v at index %v", rf.log, index)
 			rf.trimLogs(index)
-			rf.setLastSnasphottedTerm(term)
-			rf.setLastSnasphottedIndex(index)
+			rf.Debugf("TRIMMED LOGS TO %v", rf.log)
+			rf.setLastSnapshottedTerm(term)
+			rf.setLastSnapshottedIndex(index)
+
 			state := rf.generateRaftState()
 			rf.persister.Save(state, snapshot)
+			rf.Debugf("mmm===========================snapshotter: %v/T%v [%v]-[%v] xxxx %v", index, term, len(snapshot), len(rf.persister.ReadSnapshot()), rf.log)
+
 		}
 
+		rf.unlock()
+	}
+}
+
+func (rf *Raft) snapshotInstaller(server int, ch <-chan int, term int) {
+	curr := 1
+	var request *InstallSnapshotArgs
+	for !rf.killed() {
+		serial, ok := <-ch
+		if !ok {
+			return
+		}
+		rf.lock()
+		if rf.getRole() != Leader || rf.getCurrentTerm() != term || rf.killed() {
+			rf.unlock()
+			return
+		}
+		switch {
+		case request == nil || rf.getLastSnapshottedIndex() > request.LastSnapshottedIndex:
+			request = rf.constructInstallSnapshotRequest(server)
+			curr++
+		case serial >= curr:
+			curr++
+		default:
+			rf.unlock()
+			continue
+		}
+		go rf.sendInstallSnapshot(server, request, &InstallSnapshotReply{}, serial)
 		rf.unlock()
 	}
 }
@@ -921,14 +1015,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	// Your initialization code here (2A, 2B, 2C).
 	rf.logger = Logger.NewLogger(fmt.Sprintf("raft-%d.log", me))
-	rf.logger.Infof("Starting up raft-%d", me)
+	rf.Infof("Starting up raft-%d", me)
+	// Logger.SetDebugOff()
 
 	rf.setVotedFor(VOTED_FOR_NONE)
 	rf.setCurrentTerm(INIT_TERM)
 	rf.setRole(Follower)
 	rf.setLeaderId(LEADER_ID_NONE)
-	rf.setLastSnasphottedIndex(INIT_INDEX)
-	rf.setLastSnasphottedTerm(INIT_TERM)
+	rf.setLastSnapshottedIndex(INIT_INDEX)
+	rf.setLastSnapshottedTerm(INIT_TERM)
 	rf.addLogEntry(LogEntry{Term: INIT_TERM, Index: INIT_INDEX, Command: nil})
 	rf.resetElectionTimer()
 

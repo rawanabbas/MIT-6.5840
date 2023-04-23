@@ -30,12 +30,24 @@ type AppendEntriesReply struct {
 	XIndex   int  // index of the log diff
 }
 
+type InstallSnapshotArgs struct {
+	Term                 int    // leader's term
+	LeaderId             int    // so follower can redirect clients
+	LastSnapshottedIndex int    // index of last snapshot
+	LastSnapshottedTerm  int    // term of last snapshot
+	Data                 []byte // raw data of the snapshot
+}
+
+type InstallSnapshotReply struct {
+	Term int // currentTerm, for leader to update itself
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	replyCh := make(chan interface{})
 	event := rf.createEvent(EVENT_REQUEST_VOTE, args, replyCh)
 	rf.emit(event, false)
-	for !rf.killed() {
+	if !rf.killed() {
 		resp := <-replyCh
 		r := resp.(*RequestVoteReply)
 		reply.Term = r.Term
@@ -49,7 +61,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	rf.logger.Debugf("%v Snapshot called with index %v", rf.String(), index)
+	rf.Debugf("Snapshot called with index %v", index)
 	cmd := &SnapshotCommand{
 		Index: index,
 		Bytes: snapshot,
@@ -62,7 +74,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	replyCh := make(chan interface{})
 	event := rf.createEvent(EVENT_APPEND_ENTRIES, args, replyCh)
 	rf.emit(event, false)
-	for !rf.killed() {
+	if !rf.killed() {
 		resp := <-replyCh
 		r := resp.(*AppendEntriesReply)
 		reply.Term = r.Term
@@ -71,6 +83,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.XLen = r.XLen
 		reply.XTerm = r.XTerm
 		reply.XIndex = r.XIndex
+		return
+	}
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	// Your code here (2D).
+	replyCh := make(chan interface{})
+	event := rf.createEvent(EVENT_INSTALL_SNAPSHOT, args, replyCh)
+	rf.emit(event, false)
+	if !rf.killed() {
+		resp := <-replyCh
+		r := resp.(*InstallSnapshotReply)
+		reply.Term = r.Term
 		return
 	}
 }
