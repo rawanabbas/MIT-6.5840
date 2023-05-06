@@ -261,8 +261,6 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 
 func (rf *Raft) trimLogs(index int) {
 	firstIdx := rf.log[0].Index
-	rf.Debugf("firstIdx: %d realIdx: %d [%v]", firstIdx, index-firstIdx, rf.log[index-firstIdx])
-	rf.Debugf("from %v to %v", rf.log, rf.log[index-firstIdx+1:])
 	rf.log = rf.log[index-firstIdx+1:]
 }
 
@@ -630,6 +628,9 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) serve() {
+	defer func() {
+		close(rf.eventCh)
+	}()
 	for !rf.killed() {
 		event, ok := <-rf.eventCh
 		if rf.killed() || !ok {
@@ -793,12 +794,12 @@ func (rf *Raft) constructAppendEntriesRequest(server int) *AppendEntriesArgs {
 	if lastLogIndex := rf.getLastLogIndex(); lastLogIndex <= prevLogIndex {
 		entries = nil
 	} else if prevLogIndex >= rf.getLastSnapshottedIndex() {
-		rf.Debugf("construct append, prev idx: %v, sending logs %v", prevLogIndex, rf.log[prevLogIndex-rf.log[0].Index+1:])
 		newEntries := rf.log[prevLogIndex-rf.log[0].Index+1:]
 		entries = make([]LogEntry, len(newEntries))
 		copy(entries, newEntries)
 	} else {
 		entries = nil
+		return nil
 	}
 	args := AppendEntriesArgs{
 		Term:         rf.getCurrentTerm(),
@@ -837,11 +838,16 @@ func (rf *Raft) appender(server int, ch <-chan int, term int) {
 			return
 		}
 		args := rf.constructAppendEntriesRequest(server)
-		rf.unlock()
 		if args == nil {
 			rf.Infof("Cannot Send Append Entries to %v Should Send Install Snapshot", server)
+			select {
+			case rf.installSnapshotCh[server] <- 0:
+			default:
+			}
+			rf.unlock()
 			continue
 		}
+		rf.unlock()
 		reply := AppendEntriesReply{}
 		if serial == 0 || serial >= curr {
 			go rf.sendAppendEntries(server, term, args, &reply, serial)
@@ -864,17 +870,13 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 		}
 		rf.lock()
 		if !commit {
-			rf.Debugf("Applying snapshot")
 			rf.commitCh = commitCh
 			data := rf.persister.ReadSnapshot()
-			rf.Debugf("finished reading snapshot %v || %v", rf.getLastSnapshottedIndex(), len(data))
 
 			if rf.getLastSnapshottedIndex() == 0 || len(data) == 0 {
 				rf.unlock()
-				rf.Debugf("continue")
 				continue
 			}
-			rf.Debugf("last snapshotted index %v/T%v", rf.getLastSnapshottedIndex(), rf.getLastSnapshottedTerm())
 
 			applyMsg := ApplyMsg{
 				CommandValid:  false,
@@ -888,23 +890,17 @@ func (rf *Raft) committer(applyCh chan<- ApplyMsg, commitCh chan bool) {
 			continue
 		}
 		for rf.commitCh != nil && rf.getCommitIndex() > rf.getLastApplied() {
-			rf.Debugf("Applying %v", rf.getLastApplied()+1)
 			rf.incLastApplied()
-			rf.Debugf("IncLastApplied %v", rf.getLastApplied())
 			entry := rf.getLogEntry(rf.getLastApplied())
-			rf.Debugf("logs: %v", rf.log)
 			rf.unlock()
-			rf.Debugf("3 applying: %v  ||  %v", entry.Index, rf.getLastApplied())
 			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      entry.Command,
 				CommandIndex: entry.Index,
 			}
 			applyCh <- applyMsg
-			rf.Debugf("4 applied %v", entry.Index)
 			rf.lock()
 		}
-
 		rf.unlock()
 
 	}
@@ -932,7 +928,6 @@ func (rf *Raft) snapshotter(trigger <-chan bool) {
 			}
 			cmdCh = rf.snapshotCh
 		}
-
 		switch {
 		case index <= rf.getLastSnapshottedIndex():
 			// Already Snapshotted
@@ -940,18 +935,14 @@ func (rf *Raft) snapshotter(trigger <-chan bool) {
 			cmdCh = nil
 		default:
 			term := rf.getLogEntry(index).Term
-			rf.Debugf("TRIMMING LOGS FROM %v at index %v", rf.log, index)
 			rf.trimLogs(index)
-			rf.Debugf("TRIMMED LOGS TO %v", rf.log)
 			rf.setLastSnapshottedTerm(term)
 			rf.setLastSnapshottedIndex(index)
 
 			state := rf.generateRaftState()
 			rf.persister.Save(state, snapshot)
-			rf.Debugf("mmm===========================snapshotter: %v/T%v [%v]-[%v] xxxx %v", index, term, len(snapshot), len(rf.persister.ReadSnapshot()), rf.log)
 
 		}
-
 		rf.unlock()
 	}
 }

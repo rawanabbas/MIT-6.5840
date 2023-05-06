@@ -38,7 +38,7 @@ func (rf *Raft) handleRequestVote(event *Event) {
 func (rf *Raft) handleAppendEntries(event *Event) {
 	request := event.Payload.(*AppendEntriesArgs)
 	reply := &AppendEntriesReply{}
-	rf.Debugf(" an AppendEntries event %v with LC %v MC %v", len(request.Entries), request.LeaderCommit, rf.getCommitIndex())
+	rf.Debugf(" an AppendEntries event %v with LC %v MC %v, r.prevIndex: %v r.prevTerm %v", len(request.Entries), request.LeaderCommit, rf.getCommitIndex(), request.PrevLogIndex, request.PrevLogTerm)
 	rf.lock()
 	defer rf.unlock()
 	defer func() { event.Response <- reply }()
@@ -61,7 +61,6 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 	rf.resetElectionTimer()
 	lastLogIndex := rf.getLastLogIndex()
 	if request.PrevLogIndex > lastLogIndex {
-		rf.Debugf("case1 [%v], returning %v", request.PrevLogIndex, lastLogIndex+1)
 		reply.XLen = lastLogIndex + 1
 		return
 	}
@@ -77,7 +76,6 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 		for i := 0; i < len(request.Entries); i++ {
 			if request.Entries[i].Index == rf.getLastSnapshottedIndex() && request.Entries[i].Term == rf.getLastSnapshottedTerm() {
 				commonEntries = true
-				rf.Debugf(" 1an AppendEntries trim %v -> %v", request.Entries, request.Entries[i+1:])
 				request.Entries = request.Entries[i+1:]
 				break
 			}
@@ -96,10 +94,8 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 				break
 			}
 		}
-		rf.Debugf("case2 [%v], returning %v/%v", request.PrevLogIndex, reply.XIndex, reply.XTerm)
 		return
 	}
-	rf.Debugf("appending, prev index %v, my last idx %v", request.PrevLogIndex, lastLogIndex)
 
 	reply.Success = true
 	if len(request.Entries) > 0 {
@@ -108,17 +104,13 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 		presist := false
 		for i = 0; i < min(len(entries), len(request.Entries)); i++ {
 			if entries[i].Term != request.Entries[i].Term {
-				rf.Debugf("------Logs were [PLI: %v, LSI: %v, I:%v] %v  (i(%v) %v != %v)", request.PrevLogIndex, rf.getLastSnapshottedIndex(), i, rf.log, i, entries[i].Term, request.Entries[i].Term)
 				rf.log = rf.log[:request.PrevLogIndex-rf.getLastSnapshottedIndex()+i]
-				rf.Debugf("----Logs now %v", rf.log)
 				presist = true
 				break
 			}
 		}
 		if i < len(request.Entries) {
-			rf.Debugf(" 2 adding entries: %v to %v", request.Entries[i:], rf.log)
 			rf.addLogEntry(request.Entries[i:]...)
-			rf.Debugf("xxxxLogs now %v", rf.log)
 			presist = true
 		}
 
@@ -177,20 +169,29 @@ func (rf *Raft) handleShutdown(event *Event) {
 		}
 	}
 
+	for _, ch := range rf.installSnapshotCh {
+		if ch != nil {
+			close(ch)
+		}
+	}
+
 	rf.appendEntriesCh = nil
+	rf.installSnapshotCh = nil
 
 	if rf.commitCh != nil {
 		close(rf.commitCh)
 	}
 	rf.commitCh = nil
-	close(rf.eventCh)
 	rf.unlock()
 }
 
 func (rf *Raft) handleSnapshot(event *Event) {
 	rf.Debugf("Got a Snapshot event")
 	cmd := event.Payload.(*SnapshotCommand)
-	rf.snapshotCh <- *cmd
+	select {
+	case rf.snapshotCh <- *cmd:
+	default:
+	}
 }
 
 func (rf *Raft) handleInstallSnapshot(event *Event) {
@@ -199,8 +200,6 @@ func (rf *Raft) handleInstallSnapshot(event *Event) {
 	defer rf.unlock()
 	request := event.Payload.(*InstallSnapshotArgs)
 	reply := &InstallSnapshotReply{}
-	rf.Debugf("===========================InstallSnapshot: %v/T%v", request.LastSnapshottedIndex, request.LastSnapshottedTerm)
-	rf.Debugf("LOGS @ InstallSnapshot: %v/T%v: %v", request.LastSnapshottedIndex, request.LastSnapshottedTerm, rf.log)
 
 	defer func() { event.Response <- reply }()
 	term := rf.getCurrentTerm()
@@ -228,7 +227,6 @@ func (rf *Raft) handleInstallSnapshot(event *Event) {
 	for i, entry := range rf.log {
 		if entry.Index == request.LastSnapshottedIndex && entry.Term == request.LastSnapshottedTerm {
 			rf.log = rf.log[i+1:]
-			rf.Debugf("LOGS common @ InstallSnapshot: %v/T%v", request.LastSnapshottedIndex, request.LastSnapshottedTerm, rf.log)
 			commonEntries = true
 			break
 		}
@@ -237,23 +235,13 @@ func (rf *Raft) handleInstallSnapshot(event *Event) {
 	if !commonEntries {
 		rf.log = make([]LogEntry, 0)
 	}
-
-	rf.Debugf("Logs after Install Snapshot: %v | %v", rf.log, len(request.Data))
-	rf.Debugf("last applied now is %v", rf.getLastApplied())
 	state := rf.generateRaftState()
 	rf.persister.Save(state, request.Data)
-	rf.Debugf("===========================applying ins: %v/T%v", request.LastSnapshottedIndex, request.LastSnapshottedTerm)
 	if rf.commitCh != nil {
-		rf.Debugf("===========================not nil ins: %v/T%v", request.LastSnapshottedIndex, request.LastSnapshottedTerm)
-
 		go func(ch chan bool) {
-			rf.Debugf("===========================applying sending on ch: %v/T%v", request.LastSnapshottedIndex, request.LastSnapshottedTerm)
 			ch <- false
-			rf.Debugf("===========================send on ch ins: %v/T%v", request.LastSnapshottedIndex, request.LastSnapshottedTerm)
 
 		}(rf.commitCh)
 		rf.commitCh = nil
 	}
-	rf.Debugf("===========================done ins: %v/T%v", request.LastSnapshottedIndex, request.LastSnapshottedTerm)
-
 }
