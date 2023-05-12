@@ -1,16 +1,19 @@
 package kvraft
 
-import "6.5840/porcupine"
-import "6.5840/models"
-import "testing"
-import "strconv"
-import "time"
-import "math/rand"
-import "strings"
-import "sync"
-import "sync/atomic"
-import "fmt"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"6.5840/models"
+	"6.5840/porcupine"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -254,6 +257,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 	}
 	for i := 0; i < 3; i++ {
 		// log.Printf("Iteration %v\n", i)
+		t.Logf("Iteration %v\n", i)
 		atomic.StoreInt32(&done_clients, 0)
 		atomic.StoreInt32(&done_partitioner, 0)
 		go spawn_clients_and_wait(t, cfg, nclients, func(cli int, myck *Clerk, t *testing.T) {
@@ -263,17 +267,23 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 			}()
 			last := "" // only used when not randomkeys
 			if !randomkeys {
+				t.Logf("No Random Keys!")
+				t.Logf("Client %v: initial Put\n", cli)
 				Put(cfg, myck, strconv.Itoa(cli), last, opLog, cli)
 			}
 			for atomic.LoadInt32(&done_clients) == 0 {
 				var key string
 				if randomkeys {
 					key = strconv.Itoa(rand.Intn(nclients))
+					t.Logf("Random Keys! key %v\n", key)
 				} else {
 					key = strconv.Itoa(cli)
+					t.Logf("No Random Keys! key %v\n", key)
 				}
 				nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
+				t.Logf("Value %v\n", nv)
 				if (rand.Int() % 1000) < 500 {
+					t.Logf("Client %v: Append %v\n", cli, nv)
 					// log.Printf("%d: client new append %v\n", cli, nv)
 					Append(cfg, myck, key, nv, opLog, cli)
 					if !randomkeys {
@@ -298,6 +308,7 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 
 		if partitions {
 			// Allow the clients to perform some operations without interruption
+			t.Logf("Partitioning!\n")
 			time.Sleep(1 * time.Second)
 			go partitioner(t, cfg, ch_partitioner, &done_partitioner)
 		}

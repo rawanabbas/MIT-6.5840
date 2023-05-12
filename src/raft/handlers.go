@@ -84,6 +84,7 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 			request.Entries = make([]LogEntry, 0)
 		}
 	default:
+		rf.Debugf("DEFAULT [%v] request.PrevLogIndex: %v, lastIdx: %v, currentLastIdx: %d rf.getLastSnapshottedIndex(): %v, entries: %v, my logs: %v", len(rf.log), request.PrevLogIndex, lastLogIndex, rf.getLastLogIndex(), rf.getLastSnapshottedIndex(), request.Entries, rf.log)
 		prevLogTerm = rf.getLogEntry(request.PrevLogIndex).Term
 	}
 	if prevLogTerm != request.PrevLogTerm {
@@ -104,7 +105,12 @@ func (rf *Raft) handleAppendEntries(event *Event) {
 		presist := false
 		for i = 0; i < min(len(entries), len(request.Entries)); i++ {
 			if entries[i].Term != request.Entries[i].Term {
+				rf.Debugf("Mismatch term %v vs %v", entries[i], request.Entries[i])
+				rf.Debugf("Trimming logs prev log: %v, prev term: %v, snapIdx: %v, i: %v, sum: %v, current logs: %v",
+					request.PrevLogIndex, request.PrevLogTerm, rf.getLastSnapshottedIndex(), i, request.PrevLogIndex-rf.getLastSnapshottedIndex()+i, rf.log)
+
 				rf.log = rf.log[:request.PrevLogIndex-rf.getLastSnapshottedIndex()+i]
+				rf.Debugf("Entries: %v, New logs: %v", entries, rf.log)
 				presist = true
 				break
 			}
@@ -162,27 +168,27 @@ func (rf *Raft) handleEndElections(event *Event) {
 func (rf *Raft) handleShutdown(event *Event) {
 	rf.Debugf("Got a Shutdown event")
 	atomic.StoreInt32(&rf.dead, 1)
-	rf.lock()
-	for _, ch := range rf.appendEntriesCh {
-		if ch != nil {
-			close(ch)
-		}
-	}
+	// rf.lock()
+	// for _, ch := range rf.appendEntriesCh {
+	// 	if ch != nil {
+	// 		close(ch)
+	// 	}
+	// }
 
-	for _, ch := range rf.installSnapshotCh {
-		if ch != nil {
-			close(ch)
-		}
-	}
+	// for _, ch := range rf.installSnapshotCh {
+	// 	if ch != nil {
+	// 		close(ch)
+	// 	}
+	// }
 
-	rf.appendEntriesCh = nil
-	rf.installSnapshotCh = nil
+	// rf.appendEntriesCh = nil
+	// rf.installSnapshotCh = nil
 
-	if rf.commitCh != nil {
-		close(rf.commitCh)
-	}
-	rf.commitCh = nil
-	rf.unlock()
+	// if rf.commitCh != nil {
+	// 	close(rf.commitCh)
+	// }
+	// rf.commitCh = nil
+	// rf.unlock()
 }
 
 func (rf *Raft) handleSnapshot(event *Event) {

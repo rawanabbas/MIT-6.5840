@@ -628,9 +628,9 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) serve() {
-	defer func() {
-		close(rf.eventCh)
-	}()
+	// defer func() {
+	// 	close(rf.eventCh)
+	// }()
 	for !rf.killed() {
 		event, ok := <-rf.eventCh
 		if rf.killed() || !ok {
@@ -1007,7 +1007,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.logger = Logger.NewLogger(fmt.Sprintf("raft-%d.log", me))
 	rf.Infof("Starting up raft-%d", me)
-	// Logger.SetDebugOff()
+	Logger.SetDebugOff()
 
 	rf.setVotedFor(VOTED_FOR_NONE)
 	rf.setCurrentTerm(INIT_TERM)
@@ -1015,7 +1015,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.setLeaderId(LEADER_ID_NONE)
 	rf.setLastSnapshottedIndex(INIT_INDEX)
 	rf.setLastSnapshottedTerm(INIT_TERM)
-	rf.addLogEntry(LogEntry{Term: INIT_TERM, Index: INIT_INDEX, Command: nil})
 	rf.resetElectionTimer()
 
 	rf.applyCh = applyCh
