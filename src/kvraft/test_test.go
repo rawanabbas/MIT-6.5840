@@ -281,10 +281,9 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 					t.Logf("No Random Keys! key %v\n", key)
 				}
 				nv := "x " + strconv.Itoa(cli) + " " + strconv.Itoa(j) + " y"
-				t.Logf("Value %v\n", nv)
+				t.Logf("Key %v Value %v\n", key, nv)
 				if (rand.Int() % 1000) < 500 {
 					t.Logf("Client %v: Append %v\n", cli, nv)
-					// log.Printf("%d: client new append %v\n", cli, nv)
 					Append(cfg, myck, key, nv, opLog, cli)
 					if !randomkeys {
 						last = NextValue(last, nv)
@@ -331,31 +330,45 @@ func GenericTest(t *testing.T, part string, nclients int, nservers int, unreliab
 
 		if crash {
 			// log.Printf("shutdown servers\n")
+			t.Logf("Shutdown Servers!")
 			for i := 0; i < nservers; i++ {
+				t.Logf("\t-> Server %v", i)
 				cfg.ShutdownServer(i)
 			}
 			// Wait for a while for servers to shutdown, since
 			// shutdown isn't a real crash and isn't instantaneous
+			t.Logf("Wait for a while for servers to shutdown!")
 			time.Sleep(electionTimeout)
 			// log.Printf("restart servers\n")
 			// crash and re-start all
+			t.Logf("Restart Servers!")
 			for i := 0; i < nservers; i++ {
+				t.Logf("\t-> Server %v", i)
 				cfg.StartServer(i)
 			}
+			t.Logf("Connecting Servers!")
 			cfg.ConnectAll()
+			t.Logf("Servers Connected!")
 		}
 
 		// log.Printf("wait for clients\n")
+		t.Logf("Wait for clients!")
 		for i := 0; i < nclients; i++ {
 			// log.Printf("read from clients %d\n", i)
+			t.Logf("Read from clients %d\n", i)
 			j := <-clnts[i]
 			// if j < 10 {
 			// 	log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
 			// }
 			key := strconv.Itoa(i)
 			// log.Printf("Check %v for client %d\n", j, i)
+			t.Logf("Check %v for client %d\n", j, i)
 			v := Get(cfg, ck, key, opLog, 0)
 			if !randomkeys {
+				t.Log("Check clnt appends")
+				for i := 0; i < cfg.n; i++ {
+					t.Logf("\t-> Server %v, logs: %v", i, cfg.kvservers[i].db)
+				}
 				checkClntAppends(t, i, v, j)
 			}
 		}
@@ -616,17 +629,24 @@ func TestSnapshotRPC3B(t *testing.T) {
 
 	cfg.begin("Test: InstallSnapshot RPC (3B)")
 
+	t.Logf("Putting value 'A' into key 'a'")
 	Put(cfg, ck, "a", "A", nil, -1)
+	t.Logf("Checking that key 'a' has value 'A'")
 	check(cfg, t, ck, "a", "A")
 
 	// a bunch of puts into the majority partition.
+	t.Logf("Partitioning servers 0 and 1 from server 2")
 	cfg.partition([]int{0, 1}, []int{2})
 	{
+		t.Logf("Making Client 1 and connecting server 0 and 1 to it")
 		ck1 := cfg.makeClient([]int{0, 1})
+		t.Logf("Putting 50 values into keys 0-49")
 		for i := 0; i < 50; i++ {
 			Put(cfg, ck1, strconv.Itoa(i), strconv.Itoa(i), nil, -1)
 		}
+		t.Logf("Sleeping for 1 second")
 		time.Sleep(electionTimeout)
+		t.Logf("Putting value 'B' into key 'b'")
 		Put(cfg, ck1, "b", "B", nil, -1)
 	}
 

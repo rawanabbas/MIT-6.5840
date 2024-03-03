@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"sync"
@@ -159,12 +160,21 @@ func (kv *KVServer) killed() bool {
 }
 
 func (kv *KVServer) applier() {
+	lastSnapshottedIndex := kv.getLastApplied()
 	for !kv.killed() {
 		kv.Debugf("Waiting for application")
 		msg := <-kv.applyCh
-		kv.Debugf("Received -{%v}- on applyCh", msg)
+		kv.Debugf("Received CV: -{%v}- SV: -{%v}- on applyCh", msg.CommandValid, msg.SnapshotValid)
 
 		if msg.CommandValid {
+			if msg.CommandIndex-lastSnapshottedIndex > 50 {
+				select {
+				case kv.snapshotCh <- true:
+					lastSnapshottedIndex = msg.CommandIndex
+				default:
+				}
+			}
+
 			op := msg.Command.(Op)
 			kv.lock()
 			lastRequestId, ok := kv.cache[op.ClientId]
@@ -197,12 +207,81 @@ func (kv *KVServer) applier() {
 				kv.Debugf("No Channel found for -{%v}-", msg.CommandIndex)
 			}
 		} else if msg.SnapshotValid {
-
+			kv.Debugf("It is a snapshot @ index %v!", msg.SnapshotIndex)
+			kv.lock()
+			kv.setLastApplied(msg.SnapshotIndex)
+			kv.readSnapshot(msg.Snapshot)
+			kv.unlock()
 		} else {
 			continue
 		}
 	}
 	kv.Debugf("Applier exiting")
+}
+
+func (kv *KVServer) snapshotter(persister *raft.Persister) {
+	if kv.maxraftstate == -1 {
+		return
+	}
+	for !kv.killed() {
+		ratio := float64(persister.RaftStateSize()) / float64(kv.maxraftstate)
+		if ratio > 0.9 {
+			// Do Snapshot
+			kv.lock()
+			snapshot, err := kv.generateSnapshot()
+			if err != nil {
+				kv.Errorf("An error has occured while generating the snapshot! %v", err)
+				kv.unlock()
+				continue
+			}
+			kv.rf.Snapshot(kv.getLastApplied(), snapshot)
+			kv.unlock()
+			ratio = 0.0
+		}
+		select {
+		case <-time.After(time.Duration(1-ratio) * 100 * time.Millisecond):
+			kv.Debugf("Snapshot timeout triggered")
+		case <-kv.snapshotCh:
+			kv.Debugf("Snapshot triggered")
+		}
+	}
+}
+
+func (kv *KVServer) generateSnapshot() ([]byte, error) {
+	buff := new(bytes.Buffer)
+	enc := labgob.NewEncoder(buff)
+	if enc.Encode(kv.db) != nil || enc.Encode(kv.cache) != nil || enc.Encode(kv.getLastApplied()) != nil {
+		return nil, fmt.Errorf("cannot generate snapshot")
+	}
+	return buff.Bytes(), nil
+}
+
+func (kv *KVServer) readSnapshot(data []byte) {
+	kv.Debugf("Reading Snapshot")
+	kv.lock()
+	defer kv.unlock()
+	kv.Debugf("readSnapshot")
+
+	if data == nil || len(data) < 1 {
+		return
+	}
+
+	buff := bytes.NewBuffer(data)
+	dec := labgob.NewDecoder(buff)
+	var db map[string]string
+	var cache map[int64]int64
+	var lastApplied int
+	if dec.Decode(&db) != nil || dec.Decode(&cache) != nil || dec.Decode(&lastApplied) != nil {
+		kv.Errorf("Failed to recover snapshot data")
+		return
+	}
+	kv.Debugf("readSnapshot got last req: %v", cache)
+	kv.Debugf("readSnapshot got db: %v", db)
+	kv.Debugf("readSnapshot got lastApplied: %v", lastApplied)
+	kv.Debugf("--------------------")
+	kv.db = db
+	kv.cache = cache
+	kv.setLastApplied(lastApplied)
 }
 
 // servers[] contains the ports of the set of
@@ -226,7 +305,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 	kv.logger = Logger.NewLogger(fmt.Sprintf("kvserver-%d.log", me))
-	// Logger.SetDebugOff()
+	Logger.SetDebugOff()
 	// You may need initialization code here.
 
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -237,7 +316,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.responsesCh = make(map[int]chan Op)
 	kv.cache = make(map[int64]int64)
 	kv.lastApplied.Store(-1)
+	kv.readSnapshot(persister.ReadSnapshot())
 	go kv.applier()
+	go kv.snapshotter(persister)
 	return kv
 }
 
